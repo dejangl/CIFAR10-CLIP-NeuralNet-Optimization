@@ -1,0 +1,605 @@
+# =======================
+# Neural Network Optimization for CIFAR-10
+# =======================
+
+# =======================
+# 1. Installing Required Packages
+# =======================
+
+!pip install matplotlib deap tensorflow
+!pip install git+https://github.com/openai/CLIP.git
+!pip install torch torchvision
+!pip install tqdm h5py memory_profiler
+
+# =======================
+# 2. Importing Libraries
+# =======================
+import tensorflow as tf
+from tensorflow import keras
+import numpy as np
+from deap import algorithms, base, creator, tools
+import random
+import time
+import matplotlib.pyplot as plt
+import torch
+import clip
+from PIL import Image
+from tqdm import tqdm
+import pickle
+import os
+import shutil
+import gc
+import h5py
+import sys
+
+# =======================
+# 3. Initial Configuration
+# =======================
+# Set random seeds for reproducibility
+random.seed(42)
+np.random.seed(42)
+tf.random.set_seed(42)
+torch.manual_seed(42)
+
+# Limit TensorFlow GPU memory growth
+physical_devices = tf.config.list_physical_devices('GPU')
+if physical_devices:
+    try:
+        for device_gpu in physical_devices:
+            tf.config.experimental.set_memory_growth(device_gpu, True)
+    except:
+        pass
+
+# Check GPU availability
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {device}")
+
+# Enable mixed-precision training
+from tensorflow.keras import mixed_precision
+mixed_precision.set_global_policy('mixed_float16')  # <-- Added for mixed-precision
+
+# Directory to cache CLIP features
+CACHE_DIR = 'clip_features_cache'
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+# Function to clear the cache (for debugging purposes)
+def clear_cache():
+    if os.path.exists(CACHE_DIR):
+        shutil.rmtree(CACHE_DIR)
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        print(f"Cache directory '{CACHE_DIR}' deleted and recreated.")
+
+# =======================
+# 4. Loading and Preprocessing CIFAR-10 Dataset
+# =======================
+print("Loading CIFAR-10 dataset...")
+(x_train, y_train), (x_test, y_test) = keras.datasets.cifar10.load_data()
+
+# Normalize images
+x_train = x_train.astype('float32') / 255.0
+x_test = x_test.astype('float32') / 255.0
+
+# Convert labels to categorical
+y_train = keras.utils.to_categorical(y_train, 10)
+y_test = keras.utils.to_categorical(y_test, 10)
+
+# =======================
+# 5. Loading CLIP Model
+# =======================
+print("Loading CLIP model...")
+clip_model, preprocess = clip.load("ViT-B/32", device=device)
+
+# =======================
+# 6. Extracting CLIP Features and Storing in HDF5
+# =======================
+def extract_clip_features_to_hdf5(images, hdf5_path, batch_size=250, subset_name='train'):
+    """
+    Extracts CLIP features from images and stores them in an HDF5 file.
+    """
+    if os.path.exists(hdf5_path):
+        print(f"CLIP features for '{subset_name}' are already extracted and stored in '{hdf5_path}'.")
+        return
+
+    num_samples = len(images)
+    with h5py.File(hdf5_path, 'w') as h5f:
+        # Create a dataset to store features
+        h5f.create_dataset('features', shape=(num_samples, 512), dtype='float16')  # Use float16 to save space
+
+        for i in tqdm(range(0, num_samples, batch_size), desc=f"Extracting CLIP for '{subset_name}'"):
+            batch = images[i:i+batch_size]
+            resized_batch = [Image.fromarray((img * 255).astype(np.uint8)).resize((224, 224)) for img in batch]
+
+            # Preprocess images
+            images_preprocessed = torch.stack([preprocess(img) for img in resized_batch]).to(device)
+
+            with torch.no_grad():
+                image_features = clip_model.encode_image(images_preprocessed)
+                image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+                image_features = image_features.cpu().numpy().astype('float16')  # Convert to float16 to save memory
+
+            # Store features in the HDF5 file
+            h5f['features'][i:i+len(image_features)] = image_features
+
+            # Free memory
+            del batch, resized_batch, images_preprocessed, image_features
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    print(f"Extraction of CLIP features for '{subset_name}' completed and stored in '{hdf5_path}'.")
+
+# Paths to HDF5 files
+hdf5_train_path = os.path.join(CACHE_DIR, 'train_features.hdf5')
+hdf5_test_path = os.path.join(CACHE_DIR, 'test_features.hdf5')
+
+# Extract CLIP features for the training set
+print("Extracting CLIP features for the training set...")
+extract_clip_features_to_hdf5(x_train, hdf5_train_path, batch_size=250, subset_name='train')
+
+# Extract CLIP features for the test set
+print("Extracting CLIP features for the test set...")
+extract_clip_features_to_hdf5(x_test, hdf5_test_path, batch_size=250, subset_name='test')
+
+# =======================
+# 7. Loading CLIP Features from HDF5
+# =======================
+def load_clip_features(hdf5_path, subset_name='train'):
+    """
+    Loads CLIP features from an HDF5 file.
+    """
+    if not os.path.exists(hdf5_path):
+        raise FileNotFoundError(f"The HDF5 file '{hdf5_path}' for '{subset_name}' does not exist.")
+
+    with h5py.File(hdf5_path, 'r') as h5f:
+        features = h5f['features'][:].astype('float32')  # Convert to float32 for training
+
+    return features
+
+print("Loading CLIP features from HDF5 files...")
+x_train_features = load_clip_features(hdf5_train_path, 'train')
+x_test_features = load_clip_features(hdf5_test_path, 'test')
+
+# =======================
+# 8. Freeing Memory
+# =======================
+# Free original data to save memory
+del x_train, x_test
+gc.collect()
+
+# =======================
+# 9. Learning Rate Scheduler with Warmup
+# =======================
+def lr_schedule(epoch):
+    initial_lr = 0.001
+    if epoch < 5:
+        return initial_lr * ((epoch + 1) / 5)
+    return initial_lr * (0.1 ** ((epoch - 5) // 30))
+
+# =======================
+# 10. Defining the Search Space for Neural Network Architecture
+# =======================
+def create_model(architecture):
+    """
+    Creates a Keras model based on the specified architecture.
+    """
+    num_dense_layers, num_units, dropout_rates = architecture
+
+    model = keras.Sequential()
+    model.add(keras.layers.Input(shape=(512,)))  # CLIP ViT-B/32 outputs features of 512 dimensions
+
+    for i in range(num_dense_layers):
+        model.add(keras.layers.Dense(num_units[i], activation='relu'))
+        model.add(keras.layers.Dropout(dropout_rates[i]))
+
+    model.add(keras.layers.Dense(10, activation='softmax', dtype='float32'))  # Ensure output is float32
+
+    return model
+
+# =======================
+# 11. Model Performance Evaluation Function
+# =======================
+def evaluate_model(model):
+    """
+    Compiles, trains, and evaluates the model. Frees memory after evaluation.
+    """
+    optimizer = keras.optimizers.Adam(learning_rate=0.001)
+    model.compile(optimizer=optimizer, loss='categorical_crossentropy', metrics=['accuracy'])
+
+    early_stopping = keras.callbacks.EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True)
+
+    lr_scheduler_callback = keras.callbacks.LearningRateScheduler(lr_schedule)
+
+    # Use data generators instead of loading entire dataset into memory
+    train_dataset = tf.data.Dataset.from_tensor_slices((x_train_features, y_train))
+    train_dataset = train_dataset.shuffle(buffer_size=10000)
+
+    val_size = int(0.1 * len(x_train_features))
+    val_dataset = train_dataset.take(val_size).batch(64).prefetch(tf.data.AUTOTUNE)
+    train_dataset = train_dataset.skip(val_size).batch(64).prefetch(tf.data.AUTOTUNE)
+
+    test_dataset = tf.data.Dataset.from_tensor_slices((x_test_features, y_test))
+    test_dataset = test_dataset.batch(64).prefetch(tf.data.AUTOTUNE)
+
+    history = model.fit(
+        train_dataset,
+        epochs=50,
+        validation_data=val_dataset,
+        callbacks=[early_stopping, lr_scheduler_callback],
+        verbose=0
+    )
+
+    _, accuracy = model.evaluate(test_dataset, verbose=0)
+    params = model.count_params()
+
+    # Clear Keras session to free memory
+    tf.keras.backend.clear_session()
+    del model, history, train_dataset, val_dataset, test_dataset
+    gc.collect()
+
+    return accuracy, params
+
+# =======================
+# 12. NSGA-II Implementation
+# =======================
+# Define multi-objective fitness: maximize accuracy, minimize parameters
+# Prevent class redefinition by checking if classes already exist
+if not hasattr(creator, "FitnessMulti"):
+    creator.create("FitnessMulti", base.Fitness, weights=(1.0, -1.0))  # <-- Changed from (1.0, -0.5)
+    print("Created FitnessMulti class.")
+else:
+    print("FitnessMulti class already exists. Skipping creation.")
+
+if not hasattr(creator, "Individual"):
+    creator.create("Individual", list, fitness=creator.FitnessMulti)
+    print("Created Individual class.")
+else:
+    print("Individual class already exists. Skipping creation.")
+
+# Initialize a global cache for evaluated architectures
+evaluation_cache = {}
+
+# Function to generate a random architecture with slight expansion
+def random_architecture():
+    """
+    Generates a random architecture for the Keras model.
+    """
+    num_dense_layers = random.randint(1, 3)  # Maintain 1-3 layers
+    # Introduce 256 units with lower probability to enhance diversity
+    unit_choices = [64, 128]
+    if random.random() < 0.3:
+        unit_choices.append(256)  # 30% chance to include 256
+    num_units = [random.choice(unit_choices) for _ in range(num_dense_layers)]
+    # Slightly expand dropout range
+    dropout_rates = [random.uniform(0.0, 0.6) for _ in range(num_dense_layers)]
+    return [num_dense_layers, num_units, dropout_rates]
+
+# Custom crossover operator with partial layer swapping
+def custom_crossover(ind1, ind2):
+    """
+    Performs a custom crossover between two individuals.
+    Exchanges units and dropout rates for each corresponding layer.
+    """
+    # Copy individuals to avoid modifying originals
+    ind1_copy = ind1.copy()
+    ind2_copy = ind2.copy()
+
+    # Exchange the number of dense layers with a 30% probability
+    if random.random() < 0.3:
+        ind1_copy[0], ind2_copy[0] = ind2_copy[0], ind1_copy[0]
+
+    # Exchange units and dropout rates for common layers
+    min_layers = min(ind1_copy[0], ind2_copy[0])
+    for i in range(min_layers):
+        if random.random() < 0.3:
+            ind1_copy[1][i], ind2_copy[1][i] = ind2_copy[1][i], ind1_copy[1][i]
+        if random.random() < 0.3:
+            ind1_copy[2][i], ind2_copy[2][i] = ind2_copy[2][i], ind1_copy[2][i]
+
+    # Adjust the unit and dropout rate lists based on the new number of layers
+    def adjust_lists(individual):
+        num_layers = individual[0]
+        current_layers = len(individual[1])
+
+        if num_layers > current_layers:
+            for _ in range(num_layers - current_layers):
+                unit_choices = [64, 128]
+                if random.random() < 0.3:
+                    unit_choices.append(256)
+                individual[1].append(random.choice(unit_choices))
+                individual[2].append(random.uniform(0.0, 0.6))
+        elif num_layers < current_layers:
+            for _ in range(current_layers - num_layers):
+                individual[1].pop()
+                individual[2].pop()
+
+    # Adjust lists after crossover
+    adjust_lists(ind1_copy)
+    adjust_lists(ind2_copy)
+
+    # Update original individuals
+    ind1[:] = ind1_copy
+    ind2[:] = ind2_copy
+
+    return ind1, ind2
+
+# Custom mutation operator with higher diversity
+def custom_mutation(individual, indpb=0.4):  # Slightly reduced indpb to balance diversity
+    """
+    Performs a custom mutation on an individual.
+    Mutates the number of layers, units, or dropout rates.
+    """
+    # Mutate the number of dense layers with a higher probability
+    if random.random() < indpb:
+        original_layers = individual[0]
+        individual[0] = random.randint(1, 3)  # Maintain between 1 and 3
+        new_layers = individual[0]
+
+        if new_layers > original_layers:
+            # Add new layers
+            for _ in range(new_layers - original_layers):
+                unit_choices = [64, 128]
+                if random.random() < 0.3:
+                    unit_choices.append(256)
+                individual[1].append(random.choice(unit_choices))
+                individual[2].append(random.uniform(0.0, 0.6))
+        elif new_layers < original_layers:
+            # Remove layers
+            for _ in range(original_layers - new_layers):
+                individual[1].pop()
+                individual[2].pop()
+
+    # Mutate units
+    for i in range(len(individual[1])):
+        if random.random() < indpb:
+            unit_choices = [64, 128]
+            if random.random() < 0.3:
+                unit_choices.append(256)
+            individual[1][i] = random.choice(unit_choices)
+
+    # Mutate dropout rates
+    for i in range(len(individual[2])):
+        if random.random() < indpb:
+            individual[2][i] = random.uniform(0.0, 0.6)
+
+    return (individual,)
+
+# Evaluation function with architecture caching to save time
+def evaluate_individual(individual):
+    """
+    Evaluates an individual by building and training the corresponding model.
+    Utilizes a manual cache to avoid redundant evaluations.
+    """
+    try:
+        # Validate the individual with assertions
+        num_dense_layers, num_units, dropout_rates = individual
+
+        assert isinstance(num_dense_layers, int), "The number of dense layers must be an integer."
+        assert 1 <= num_dense_layers <= 3, "The number of dense layers must be between 1 and 3."
+        assert isinstance(num_units, list) and isinstance(dropout_rates, list), "num_units and dropout_rates must be lists."
+        assert len(num_units) == num_dense_layers, "The number of units must correspond to the number of layers."
+        assert len(dropout_rates) == num_dense_layers, "The number of dropout rates must correspond to the number of layers."
+
+        # Create a unique key for the architecture
+        architecture_key = (num_dense_layers, tuple(num_units), tuple(round(rate, 2) for rate in dropout_rates))
+
+        # Check if the architecture has already been evaluated
+        if architecture_key in evaluation_cache:
+            return evaluation_cache[architecture_key]
+
+        # Create and evaluate the model
+        model = create_model(individual)
+        accuracy, params = evaluate_model(model)
+
+        # Store the result in the cache
+        evaluation_cache[architecture_key] = (accuracy, params)
+
+        return accuracy, params
+
+    except AssertionError as e:
+        print(f"Validation error for individual {individual}: {e}")
+        # Return worst possible values if evaluation fails
+        return 0.0, float('inf')
+    except Exception as e:
+        print(f"Error during evaluation of individual {individual}: {e}")
+        # Return worst possible values if evaluation fails
+        return 0.0, float('inf')
+
+# =======================
+# 13. DEAP Toolbox Configuration
+# =======================
+toolbox = base.Toolbox()
+toolbox.register("individual", tools.initIterate, creator.Individual, random_architecture)
+toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+toolbox.register("evaluate", evaluate_individual)  # Updated to use evaluate_individual
+toolbox.register("mate", custom_crossover)
+toolbox.register("mutate", custom_mutation, indpb=0.4)  # Updated indpb
+toolbox.register("select", tools.selNSGA2)
+
+# =======================
+# 14. Functions to Run NSGA-II, Random NAS, and Hybrid NAS
+# =======================
+def run_nsga2(pop_size=10, num_generations=5):
+    """
+    Runs NSGA-II evolution with the specified parameters.
+    """
+    pop = toolbox.population(n=pop_size)
+    hof = tools.HallOfFame(1)
+    stats = tools.Statistics(lambda ind: ind.fitness.values)
+    stats.register("avg", np.mean, axis=0)
+    stats.register("std", np.std, axis=0)
+    stats.register("min", np.min, axis=0)
+    stats.register("max", np.max, axis=0)
+
+    print("Starting NSGA-II evolution...")
+    pop, logbook = algorithms.eaMuPlusLambda(
+        pop, toolbox,
+        mu=pop_size,
+        lambda_=pop_size,
+        cxpb=0.7,
+        mutpb=0.3,
+        ngen=num_generations,
+        stats=stats,
+        halloffame=hof,
+        verbose=True
+    )
+    return pop, logbook  # <-- Return logbook for plotting
+
+def run_random_nas(num_samples=10):
+    """
+    Randomly generates architectures and evaluates their performance.
+    """
+    population = []
+    print("Starting Random NAS...")
+    for _ in tqdm(range(num_samples), desc="Random NAS"):
+        individual = random_architecture()
+        fitness = evaluate_individual(individual)
+        population.append((individual, fitness))
+    return population
+
+def run_hybrid_nas(pop_size=15, num_generations=5, num_random=3):
+    """
+    Combines Random NAS and NSGA-II to generate a hybrid population.
+    """
+    print("Starting Hybrid NAS...")
+    random_pop = run_random_nas(num_random)
+    nsga2_pop, _ = run_nsga2(pop_size - num_random, num_generations)
+
+    # Extract individuals and their fitness
+    nsga2_results = [(ind, ind.fitness.values) for ind in nsga2_pop]
+    combined_pop = random_pop + nsga2_results
+    return combined_pop
+
+# =======================
+# 15. Functions to Analyze and Plot Results
+# =======================
+def analyze_results(results, method_name):
+    """
+    Analyzes the results of a specific NAS method.
+    """
+    if method_name == "NSGA-II":
+        accuracies = [fit[0] for ind, fit in results if isinstance(fit, tuple) and len(fit) == 2]
+        params = [fit[1] for ind, fit in results if isinstance(fit, tuple) and len(fit) == 2]
+    else:
+        accuracies = [fit[0] for arch, fit in results if isinstance(fit, tuple) and len(fit) == 2]
+        params = [fit[1] for arch, fit in results if isinstance(fit, tuple) and len(fit) == 2]
+
+    if not accuracies:
+        print(f"\n{method_name} Results: No valid results")
+        return
+
+    print(f"\n{method_name} Results:")
+    print(f"Average Accuracy: {np.mean(accuracies):.4f}")
+    print(f"Average Number of Parameters: {np.mean(params):.2e}")
+    print(f"Best Accuracy: {np.max(accuracies):.4f}")
+    print(f"Best Number of Parameters: {np.min(params):.2e}")
+
+def plot_results(results, method_name, logbook=None):
+    """
+    Plots the results of a specific NAS method.
+    """
+    accuracies = []
+    params = []
+
+    if method_name == "NSGA-II":
+        # NSGA-II results are a list of individuals
+        for ind, fit in results:
+            if hasattr(ind, 'fitness') and ind.fitness.valid:
+                accuracies.append(fit[0])
+                params.append(fit[1])
+    else:
+        # Random NAS and Hybrid NAS results are lists of tuples
+        for arch, fit in results:
+            if isinstance(fit, tuple) and len(fit) == 2:
+                accuracies.append(fit[0])
+                params.append(fit[1])
+
+    if not accuracies:
+        print(f"No valid results to plot for {method_name}")
+        return
+
+    plt.figure(figsize=(14, 6))
+
+    # Scatter plot: Number of Parameters vs Accuracy
+    plt.subplot(1, 2, 1)
+    plt.scatter(params, accuracies, c='blue', alpha=0.7)
+    plt.xlabel('Number of Parameters')
+    plt.ylabel('Accuracy')
+    plt.title(f'{method_name}: Accuracy vs Parameters')
+    plt.grid(True)
+
+    # Histogram of Accuracies
+    plt.subplot(1, 2, 2)
+    plt.hist(accuracies, bins=10, color='green', alpha=0.7)
+    plt.xlabel('Accuracy')
+    plt.ylabel('Frequency')
+    plt.title(f'{method_name}: Accuracy Distribution')
+    plt.grid(True)
+
+    plt.tight_layout()
+    plt.show()
+
+    # Histogram of Parameter Counts
+    plt.figure(figsize=(7, 6))
+    plt.hist(params, bins=10, color='orange', alpha=0.7)
+    plt.xlabel('Number of Parameters')
+    plt.ylabel('Frequency')
+    plt.title(f'{method_name}: Parameter Count Distribution')
+    plt.grid(True)
+    plt.show()
+
+    # If NSGA-II, plot convergence over generations
+    if method_name == "NSGA-II" and logbook is not None:
+        gen = logbook.select("gen")
+        avg_fit = logbook.select("avg")
+        min_fit = logbook.select("min")
+        max_fit = logbook.select("max")
+
+        avg_accuracy = [fit[0] for fit in avg_fit]
+        min_accuracy = [fit[0] for fit in min_fit]
+        max_accuracy = [fit[0] for fit in max_fit]
+
+        plt.figure(figsize=(10, 6))
+        plt.plot(gen, avg_accuracy, label='Average Accuracy')
+        plt.fill_between(gen, min_accuracy, max_accuracy, alpha=0.2, label='Min-Max Accuracy Range')
+        plt.xlabel('Generation')
+        plt.ylabel('Accuracy')
+        plt.title('NSGA-II: Accuracy over Generations')
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+
+# =======================
+# 16. Running the Experiments
+# =======================
+start_time = time.time()
+
+try:
+    # Run NSGA-II with logbook
+    nsga2_pop, nsga2_logbook = run_nsga2(pop_size=10, num_generations=5)
+    nsga2_results = [(ind, ind.fitness.values) for ind in nsga2_pop]
+
+    # Run Random NAS
+    random_nas_results = run_random_nas(num_samples=10)
+
+    # Run Hybrid NAS
+    hybrid_nas_results = run_hybrid_nas(pop_size=15, num_generations=5, num_random=3)  # <-- Adjusted num_random
+
+    end_time = time.time()
+    print(f"\nTotal execution time: {end_time - start_time:.2f} seconds")
+
+    # Analyze and compare results
+    analyze_results(nsga2_results, "NSGA-II")
+    analyze_results(random_nas_results, "Random NAS")
+    analyze_results(hybrid_nas_results, "Hybrid NAS")
+
+    # Visualize results
+    plot_results(nsga2_results, "NSGA-II", logbook=nsga2_logbook)
+    plot_results(random_nas_results, "Random NAS")
+    plot_results(hybrid_nas_results, "Hybrid NAS")
+
+except KeyboardInterrupt:
+    print("Execution interrupted by user")
+except Exception as e:
+    print(f"An error occurred: {e}")
+finally:
+    final_end_time = time.time()
+    print(f"Final total execution time: {final_end_time - start_time:.2f} seconds")
